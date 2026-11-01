@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fastcarmeta-server
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
