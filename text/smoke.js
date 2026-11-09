@@ -108,6 +108,18 @@ function client(name, id) {
   assert(r2.last('go') && r2.last('go').city, 'any: kalabalık şehir seçilmedi');
   console.log('any (kalabalık olan) OK');
 
+
+  // ---- KVKK/GDPR: silme hakkı ve saklama
+  const post = (p, obj) => new Promise((r) => { const body = JSON.stringify(obj); const q = http.request({ host: 'localhost', port: 3919, path: p, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => { let d = ''; res.on('data', (c) => (d += c)); res.on('end', () => r({ code: res.statusCode, body: JSON.parse(d) })); }); q.write(body); q.end(); });
+  const delId = 'del-test-0000-1111';
+  assert.strictEqual((await post('/api/score', { track: 'Track03', id: delId, name: 'Silinecek', score: 500, time: 60 })).code, 200);
+  assert.strictEqual((await get('/api/leaderboard?track=Track03&id=' + delId)).rank, 1, 'skor yazılmadı');
+  const dr = await post('/api/delete', { id: delId });
+  assert(dr.code === 200 && dr.body.removed === 1, 'silme çalışmadı');
+  assert.strictEqual((await get('/api/leaderboard?track=Track03&id=' + delId)).rank, 0, 'kayıt silinmedi');
+  assert.strictEqual((await post('/api/delete', { id: '../x' })).code, 400, 'kötü kimlik reddedilmeli');
+  console.log('veri silme OK');
+
   // tek başına yarış (yapay zekâ dolgusu)
   const s = client('Solo', 'cccccccc-3333');
   await s.open;

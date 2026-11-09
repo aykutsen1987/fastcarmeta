@@ -1,7 +1,7 @@
 'use strict';
 /**
  * FastCarMeta sunucusu
- *  - HTTP:  GET /api/health, POST /api/score, GET /api/leaderboard
+ *  - HTTP:  GET /api/health, POST /api/score, GET /api/leaderboard, POST /api/delete (KVKK/GDPR: kullanıcının verisini siler)
  *  - WS:    /ws  (lobi, eşleşme, yarış içi konum aktarımı, sonuçlar)
  * Veri: bellekte; DATA_FILE'a (varsayılan data/leaderboard.json) kaydedilir.
  * Render ücretsiz planında disk kalıcı değildir: yeniden dağıtımda sıralama sıfırlanabilir (README'ye bak).
@@ -60,6 +60,25 @@ function submitScore(track, id, name, score, time) {
   else cur.name = name;
   scheduleSave();
 }
+
+// KVKK/GDPR silme hakkı: bir cihaz kimliğine ait tüm sıralama kayıtlarını siler.
+function deleteById(id) {
+  let removed = 0;
+  for (const t of Object.values(store.tracks)) if (t[id]) { delete t[id]; removed++; }
+  if (removed) scheduleSave();
+  return removed;
+}
+
+// Saklama süresi: 365 günden eski sıralama kayıtları otomatik silinir (gizlilik politikasında yazar).
+const RETENTION_MS = parseInt(process.env.RETENTION_DAYS || '365', 10) * 86400000;
+function purgeOld() {
+  const limit = now() - RETENTION_MS;
+  let n = 0;
+  for (const t of Object.values(store.tracks)) for (const [id, v] of Object.entries(t)) if ((v.at || 0) < limit) { delete t[id]; n++; }
+  if (n) { scheduleSave(); console.log('Saklama süresi dolan kayıt silindi:', n); }
+}
+purgeOld();
+setInterval(purgeOld, 6 * 3600 * 1000).unref();
 
 function board(track, limit, id) {
   const t = store.tracks[track] || {};
@@ -126,6 +145,21 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+
+  if (url.pathname === '/api/delete' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1024) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const m = JSON.parse(body);
+        if (!validId(m.id)) return send(res, 400, { error: 'bad_id' });
+        const removed = deleteById(m.id);
+        for (const p of players.values()) if (p.id === m.id) p.id = 'deleted-' + p.pid;   // açık bağlantı aynı kimlikle tekrar kayıt yazmasın
+        return send(res, 200, { ok: true, removed });
+      } catch (e) { return send(res, 400, { error: 'bad_json' }); }
+    });
+    return;
+  }
   send(res, 404, { error: 'not_found' });
 });
 
@@ -175,7 +209,7 @@ function joinCity(p) {
   tx(p, { t: 'go', track: 'City', city: true, laps: 0, seed: room.seed, startAt: now(), solo: false, players: list });
   const peer = JSON.stringify({ t: 'peer', player: pinfo(p) });
   for (const o of room.players.values()) if (o !== p) tx(o, peer);
-  console.log(`[city ${room.id}] ${p.name} girdi (${room.players.size}/${MAX_CITY})`);
+  console.log(`[city ${room.id}] oyuncu #${p.pid} girdi (${room.players.size}/${MAX_CITY})`);
 }
 
 // "İkisi de" seçili oyuncu: oyuncusu olan yarış lobisi ile şehir odasından kalabalık olana gider (eşitse yarış; ikisi de boşsa yarış lobisinde bekler).
