@@ -14,6 +14,7 @@ const { WebSocketServer } = require('ws');
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'leaderboard.json');
 const MAX_ROOM = 8;
+const MAX_CITY = 12;                                                        // şehir odası kapasitesi
 const LOBBY_COUNTDOWN = parseFloat(process.env.LOBBY_COUNTDOWN || '12');   // 2. oyuncudan sonra (sn)
 const LOBBY_SOLO_WAIT = parseFloat(process.env.LOBBY_SOLO_WAIT || '25');   // tek kişi bekleme (sn)
 const GO_DELAY_MS = parseInt(process.env.GO_DELAY_MS || '9000', 10);       // "go" ile gerçek başlangıç arası
@@ -98,7 +99,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, '');
   const url = new URL(req.url, 'http://localhost');
 
-  if (url.pathname === '/api/health') return send(res, 200, { ok: true, rooms: rooms.size, players: players.size, uptime: Math.round(process.uptime()) });
+  if (url.pathname === '/api/health') return send(res, 200, { ok: true, rooms: rooms.size, cityRooms: [...rooms.values()].filter((r) => r.kind === 'city').length, players: players.size, uptime: Math.round(process.uptime()) });
   if (url.pathname === '/') return send(res, 200, 'FastCarMeta server OK');
   if (limited(ip)) return send(res, 429, { error: 'too_many_requests' });
 
@@ -146,10 +147,47 @@ function broadcastRoom(room) {
 }
 
 function findOrCreateRoom(track, laps) {
-  for (const r of rooms.values()) if (r.state === 'lobby' && r.track === track && r.players.size < MAX_ROOM) return r;
-  const r = { id: nextRoom++, track, laps, state: 'lobby', players: new Map(), createdAt: now(), countdownEnd: null, solo: false, seed: 0, startAt: 0, firstFinishAt: 0 };
+  for (const r of rooms.values()) if (r.kind !== 'city' && r.state === 'lobby' && r.track === track && r.players.size < MAX_ROOM) return r;
+  const r = { id: nextRoom++, kind: 'race', track, laps, state: 'lobby', players: new Map(), createdAt: now(), countdownEnd: null, solo: false, seed: 0, startAt: 0, firstFinishAt: 0 };
   rooms.set(r.id, r);
   return r;
+}
+
+// ---- Şehir odası: açık dünya. Geri sayım ve sonuç yok; oyuncu girince hemen oynar, çıkınca diğerlerinden silinir.
+function openCityRoom() {
+  for (const r of rooms.values()) if (r.kind === 'city' && r.players.size < MAX_CITY) return r;
+  return null;
+}
+
+function joinCity(p) {
+  let room = openCityRoom();
+  if (!room) {
+    room = { id: nextRoom++, kind: 'city', track: 'City', laps: 0, state: 'city', players: new Map(), createdAt: now(), countdownEnd: null, solo: false, seed: 1 + Math.floor(Math.random() * 1000000), startAt: 0, firstFinishAt: 0 };
+    rooms.set(room.id, room);
+  }
+  const used = new Set([...room.players.values()].map((o) => o.slot));
+  let slot = 0;
+  while (used.has(slot)) slot++;
+  p.slot = slot; p.finished = false; p.finishTime = -1; p.score = 0; p.lastPose = 0;
+  room.players.set(p.pid, p);
+  p.room = room;
+  const list = roomPlayers(room).map(pinfo);
+  tx(p, { t: 'go', track: 'City', city: true, laps: 0, seed: room.seed, startAt: now(), solo: false, players: list });
+  const peer = JSON.stringify({ t: 'peer', player: pinfo(p) });
+  for (const o of room.players.values()) if (o !== p) tx(o, peer);
+  console.log(`[city ${room.id}] ${p.name} girdi (${room.players.size}/${MAX_CITY})`);
+}
+
+// "İkisi de" seçili oyuncu: oyuncusu olan yarış lobisi ile şehir odasından kalabalık olana gider (eşitse yarış; ikisi de boşsa yarış lobisinde bekler).
+function pickForAny(track) {
+  let race = null, city = null;
+  for (const r of rooms.values()) {
+    if (r.kind === 'city') { if (r.players.size > 0 && r.players.size < MAX_CITY && (!city || r.players.size > city.players.size)) city = r; }
+    else if (r.state === 'lobby' && r.track === track && r.players.size > 0 && r.players.size < MAX_ROOM && (!race || r.players.size > race.players.size)) race = r;
+  }
+  if (race && city) return city.players.size > race.players.size ? 'city' : 'race';
+  if (city) return 'city';
+  return 'race';
 }
 
 function leaveRoom(p) {
@@ -157,7 +195,7 @@ function leaveRoom(p) {
   if (!room) return;
   room.players.delete(p.pid);
   p.room = null;
-  if (room.state === 'racing' || room.state === 'done') {
+  if (room.state === 'racing' || room.state === 'done' || room.state === 'city') {
     const msg = JSON.stringify({ t: 'left', pid: p.pid });
     for (const o of room.players.values()) tx(o, msg);
     if (room.state === 'racing') checkResults(room);
@@ -233,8 +271,11 @@ wss.on('connection', (ws, req) => {
 
       case 'join': {
         if (!p.hello) return tx(p, { t: 'error', err: 'hello_first' });
-        if (!validTrack(m.track)) return tx(p, { t: 'error', err: 'bad_track' });
+        // mode: 'race' (varsayılan), 'city' veya 'any' (hangisi doluysa oraya)
+        const mode = m.mode === 'city' || m.mode === 'any' ? m.mode : 'race';
+        if (mode !== 'city' && !validTrack(m.track)) return tx(p, { t: 'error', err: 'bad_track' });
         if (p.room) leaveRoom(p);
+        if (mode === 'city' || (mode === 'any' && pickForAny(m.track) === 'city')) { joinCity(p); break; }
         const room = findOrCreateRoom(m.track, Math.max(1, Math.min(10, Math.round(num(m.laps, 3)))));
         room.players.set(p.pid, p);
         p.room = room;
@@ -248,7 +289,7 @@ wss.on('connection', (ws, req) => {
 
       case 'pose': {
         const room = p.room;
-        if (!room || room.state !== 'racing') return;
+        if (!room || (room.state !== 'racing' && room.state !== 'city')) return;
         const t = now();
         if (t - p.lastPose < 40) return;                      // en çok 25 Hz
         p.lastPose = t;

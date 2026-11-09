@@ -64,6 +64,50 @@ function client(name, id) {
   assert.strictEqual(lb.rank, 2);
   console.log('sıralama OK: sıra', lb.rank, '/', lb.count);
 
+
+  // ---- şehir odası ve "ikisi de" eşleşmesi
+  const c1 = client('Can', 'dddddddd-4444'), c2 = client('Deniz', 'eeeeeeee-5555'), c3 = client('Esra', 'ffffffff-6666');
+  await c1.open; await c2.open; await c3.open;
+  for (const c of [c1, c2, c3]) c.send({ t: 'hello', id: c.id, name: c.name, car: 'sedan' });
+  await wait(200);
+  c1.send({ t: 'join', mode: 'city', track: 'Track04', laps: 3 });
+  await wait(200);
+  const g1 = c1.last('go');
+  assert(g1 && g1.city === true && g1.track === 'City' && g1.players.length === 1, 'şehir go hatalı');
+  c2.send({ t: 'join', mode: 'city' });
+  await wait(200);
+  const g2 = c2.last('go');
+  assert(g2 && g2.city && g2.players.length === 2, 'ikinci oyuncu şehre girmedi');
+  const peer = c1.last('peer');
+  assert(peer && peer.player.name === 'Deniz', 'peer bildirimi yok');
+  assert.notStrictEqual(g2.players[0].slot, g2.players[1].slot, 'şehirde slotlar farklı olmalı');
+  c2.send({ t: 'pose', x: 7, y: 1, z: 9, qw: 1, vx: 0, vz: 0, sp: 10, sc: 0 });
+  await wait(200);
+  assert(c1.last('pose') && c1.last('pose').x === 7, 'şehirde pose iletilmedi');
+  console.log('şehir odası OK');
+
+  c3.send({ t: 'join', mode: 'any', track: 'Track05', laps: 3 });      // şehirde 2 kişi var, yarış lobisi boş: şehre gitmeli
+  await wait(200);
+  const g3 = c3.last('go');
+  assert(g3 && g3.city && g3.players.length === 3, 'any: şehre yönlenmedi');
+  console.log('any > şehir OK');
+
+  c2.send({ t: 'leave' });
+  await wait(200);
+  assert(c1.last('left') && c1.last('left').pid === c2.last('welcome').pid, 'şehirde left yayını yok');
+  console.log('şehirden çıkış OK');
+
+  const r1 = client('Rana', '11111111-7777'), r2 = client('Reha', '22222222-8888');
+  await r1.open; await r2.open;
+  r1.send({ t: 'hello', id: r1.id, name: 'Rana', car: 'sedan' }); r2.send({ t: 'hello', id: r2.id, name: 'Reha', car: 'sedan' });
+  await wait(200);
+  r1.send({ t: 'join', mode: 'race', track: 'Track06', laps: 3 });
+  await wait(200);
+  r2.send({ t: 'join', mode: 'any', track: 'Track06', laps: 3 });      // yarış lobisinde 1 kişi, şehirde 3 kişi: kalabalık olan şehir
+  await wait(200);
+  assert(r2.last('go') && r2.last('go').city, 'any: kalabalık şehir seçilmedi');
+  console.log('any (kalabalık olan) OK');
+
   // tek başına yarış (yapay zekâ dolgusu)
   const s = client('Solo', 'cccccccc-3333');
   await s.open;
