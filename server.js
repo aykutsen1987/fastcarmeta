@@ -3,8 +3,8 @@
  * FastCarMeta sunucusu
  *  - HTTP:  GET /api/health, POST /api/score, GET /api/leaderboard, POST /api/delete (KVKK/GDPR: kullanıcının verisini siler)
  *  - WS:    /ws  (lobi, eşleşme, yarış içi konum aktarımı, sonuçlar)
- * Veri: bellekte; DATA_FILE'a (varsayılan data/leaderboard.json) kaydedilir.
- * Render ücretsiz planında disk kalıcı değildir: yeniden dağıtımda sıralama sıfırlanabilir (README'ye bak).
+ * Veri: bellekte tutulur. DATABASE_URL (Neon PostgreSQL) tanımlıysa KALICI olarak veritabanına yazılır (db.js);
+ * tanımlı değilse DATA_FILE'a (varsayılan data/leaderboard.json) kaydedilir. Render ücretsiz planında disk kalıcı değildir.
  */
 const http = require('http');
 const fs = require('fs');
@@ -38,8 +38,12 @@ try {
   if (!store.tracks) store.tracks = {};
 } catch (e) { console.warn('Veri okunamadı, boş başlatılıyor:', e.message); }
 
+let db = null;                      // DATABASE_URL varsa db.js nesnesi
+const dbLog = (what) => (e) => console.warn('Veritabanı hatası (' + what + '):', e.message);
+
 let saveTimer = null;
 function scheduleSave() {
+  if (db) return;                   // veritabanı modunda dosyaya yazılmaz
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
@@ -56,8 +60,13 @@ function submitScore(track, id, name, score, time) {
   const t = (store.tracks[track] = store.tracks[track] || {});
   const cur = t[id];
   const better = !cur || score > cur.score || (score === cur.score && time >= 0 && (cur.time < 0 || time < cur.time));
-  if (better) t[id] = { name, score, time, at: now() };
-  else cur.name = name;
+  if (better) {
+    t[id] = { name, score, time, at: now() };
+    if (db) db.upsert(track, id, t[id]).catch(dbLog('score'));
+  } else if (cur.name !== name) {
+    cur.name = name;
+    if (db) db.updateName(track, id, name).catch(dbLog('name'));
+  }
   scheduleSave();
 }
 
@@ -65,6 +74,7 @@ function submitScore(track, id, name, score, time) {
 function deleteById(id) {
   let removed = 0;
   for (const t of Object.values(store.tracks)) if (t[id]) { delete t[id]; removed++; }
+  if (db) db.deleteById(id).catch(dbLog('delete'));      // KVKK: kalıcı depodan da silinir
   if (removed) scheduleSave();
   return removed;
 }
@@ -75,9 +85,9 @@ function purgeOld() {
   const limit = now() - RETENTION_MS;
   let n = 0;
   for (const t of Object.values(store.tracks)) for (const [id, v] of Object.entries(t)) if ((v.at || 0) < limit) { delete t[id]; n++; }
+  if (db) db.purgeOlderThan(limit).catch(dbLog('purge'));
   if (n) { scheduleSave(); console.log('Saklama süresi dolan kayıt silindi:', n); }
 }
-purgeOld();
 setInterval(purgeOld, 6 * 3600 * 1000).unref();
 
 function board(track, limit, id) {
@@ -369,9 +379,27 @@ setInterval(() => {
 }, 20000).unref();
 
 process.on('SIGTERM', () => {
+  if (db) process.exit(0);          // veriler zaten veritabanında
   try { fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true }); fs.writeFileSync(DATA_FILE, JSON.stringify(store)); } catch (e) { /* yoksay */ }
   process.exit(0);
 });
 
-server.listen(PORT, () => console.log(`FastCarMeta sunucusu ${PORT} portunda`));
+// Açılış: DATABASE_URL varsa önce veritabanından yükle, sonra dinlemeye başla.
+async function start() {
+  if (process.env.DATABASE_URL) {
+    try {
+      db = await require('./db').open(process.env.DATABASE_URL);
+      store.tracks = await db.loadAll();
+      console.log('Veritabanı bağlandı (Neon/PostgreSQL), kayıtlı pist sayısı:', Object.keys(store.tracks).length);
+    } catch (e) {
+      console.error('Veritabanına bağlanılamadı, dosya moduna dönülüyor:', e.message);
+      db = null;
+    }
+  } else {
+    console.log('DATABASE_URL yok: veriler dosyaya yazılacak (Render ücretsiz planda kalıcı değildir).');
+  }
+  purgeOld();
+  server.listen(PORT, () => console.log(`FastCarMeta sunucusu ${PORT} portunda`));
+}
+start();
 module.exports = { server };
